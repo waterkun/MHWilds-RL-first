@@ -1,0 +1,386 @@
+import cv2
+import numpy as np
+import pytesseract
+from collections import deque
+
+# 指定 Tesseract-OCR 的安装路径
+# 如果你安装在其他盘符，请修改下面的路径
+pytesseract.pytesseract.tesseract_cmd = r'E:\Program Files\Tesseract-OCR\tesseract.exe'
+
+class ImageProcessor:
+    def __init__(self, input_shape=(84, 84)):
+        """
+        :param input_shape: 神经网络期望的输入尺寸 (width, height)
+        """
+        self.input_shape = input_shape
+
+    def preprocess_frame(self, frame):
+        """
+        预处理画面供 Agent 使用：
+        1. 灰度化
+        2. 缩放
+        3. 归一化 (可选，通常 Gym Wrapper 会处理，这里先返回 uint8)
+        """
+        # 转换为灰度图
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # 缩放到目标尺寸 (例如 84x84)
+        resized = cv2.resize(gray, self.input_shape, interpolation=cv2.INTER_AREA)
+        
+        # 增加一个维度以匹配 (H, W, C) 格式，虽然是单通道
+        processed = resized[:, :, np.newaxis]
+        
+        return processed
+
+    def extract_health_bar(self, frame, roi):
+        """
+        从画面中提取血量百分比 (基于颜色阈值)
+        :param frame: 原始 BGR 图像
+        :param roi: 感兴趣区域 (x, y, w, h) - 需要根据游戏UI手动测量
+        :return: float (0.0 - 1.0)
+        """
+        x, y, w, h = roi
+        crop = frame[y:y+h, x:x+w]
+        
+        # 转换为 HSV 空间以便进行颜色分割
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        
+        # 定义绿色的范围 (怪物猎人血条通常是绿色)
+        # 注意：这些值需要根据实际游戏截图进行校准
+        lower_green = np.array([40, 50, 50])
+        upper_green = np.array([80, 255, 255])
+        
+        # 创建掩码
+        mask = cv2.inRange(hsv, lower_green, upper_green)
+        
+        # 计算非零像素点 (即绿色像素)
+        green_pixels = cv2.countNonZero(mask)
+        total_pixels = w * h # 或者 mask.size
+        
+        # 简单的占比计算
+        health_ratio = green_pixels / total_pixels if total_pixels > 0 else 0.0
+        
+        return health_ratio, mask # 返回 mask 用于调试
+
+    def extract_digits(self, frame, roi):
+        """
+        使用 OCR 识别指定区域的数字 (例如伤害数值、道具数量)
+        :param frame: 原始 BGR 图像
+        :param roi: (x, y, w, h)
+        :return: int (识别到的数字) 或 None (未识别到)
+        """
+        x, y, w, h = roi
+        # 边界检查
+        if x < 0 or y < 0 or w <= 0 or h <= 0:
+            return None
+            
+        crop = frame[y:y+h, x:x+w]
+        
+        # 图像预处理：灰度 -> 二值化 (黑白分明利于 OCR)
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        # 使用 Otsu 自动阈值，或者根据游戏字体颜色手动调整
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # 配置 Tesseract:
+        # --psm 7: 将图像视为单行文本
+        # outputbase digits: 限制只识别数字
+        config = r'--psm 7 -c tessedit_char_whitelist=0123456789'
+        
+        try:
+            text = pytesseract.image_to_string(thresh, config=config)
+            # 过滤掉非数字字符（以防万一）
+            digits = ''.join(filter(str.isdigit, text))
+            return int(digits) if digits else None, thresh
+        except Exception:
+            return None, thresh
+
+    def detect_hit_signals(self, frame, roi):
+        """
+        检测屏幕上的伤害数字色块 (代替 OCR)
+        :param frame: 原始图像
+        :param roi: 搜索区域 (通常是屏幕中心一大片区域)
+        :return: int (检测到的伤害数字数量/强度), mask (调试用)
+        """
+        x, y, w, h = roi
+        crop = frame[y:y+h, x:x+w]
+        
+        # 转换到 HSV 颜色空间
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        
+        # --- 定义伤害数字的颜色范围 ---
+        # 1. 黄色/橙色 (弱点/暴击)
+        # 基于之前数据: H(15-35), S(60+), V(180+)
+        lower_yellow = np.array([15, 60, 180]) 
+        upper_yellow = np.array([35, 255, 255])
+        mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
+        
+        # 2. 白色 (普通伤害)
+        # 基于新数据: HSV: [0, 0, 252] 和 [0, 0, 215]
+        # 特征: 饱和度(S)极低，亮度(V)极高
+        lower_white = np.array([0, 0, 200])
+        upper_white = np.array([180, 40, 255]) # H任意，S低，V高
+        mask_white = cv2.inRange(hsv, lower_white, upper_white)
+        
+        # 合并掩码 (只要满足黄色 OR 白色都算击中)
+        mask = cv2.bitwise_or(mask_yellow, mask_white)
+        
+        # 膨胀操作：把断裂的数字笔画连成一个整体
+        kernel = np.ones((3,3), np.uint8)
+        mask = cv2.dilate(mask, kernel, iterations=2)
+        
+        # 查找轮廓
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        hit_count = 0
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            # 过滤噪点：太小的不是数字，太大的可能是UI背景
+            if 50 < area < 3000:
+                hit_count += 1
+                
+        return hit_count, mask
+
+    def analyze_color_state(self, frame, roi, color_map, threshold=0.01):
+        """
+        统计区域内各颜色的像素数量，返回占比最高的颜色 (用于识别斩位/气刃等级)
+        :param frame: 原始图像
+        :param roi: (x, y, w, h)
+        :param color_map: dict { 'name': (lower_np, upper_np) }
+        :param threshold: 最小像素占比阈值 (0.0 - 1.0)，低于此值视为 'none'
+        :return: (dominant_color_name, fill_ratio, best_mask)
+        """
+        x, y, w, h = roi
+        if w <= 0 or h <= 0: return 'none', 0.0, None
+        
+        crop = frame[y:y+h, x:x+w]
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        
+        # --- 1. 计算填充率 (基于亮度) ---
+        # 只要像素足够亮 (V > 100)，就认为是气槽的一部分 (包含红色、黄色、白色波浪)
+        # 这相当于 "Total - Empty(Dark)"
+        bright_mask = cv2.inRange(hsv, np.array([0, 0, 100]), np.array([180, 255, 255]))
+        bright_pixels = cv2.countNonZero(bright_mask)
+        total_pixels = w * h
+        fill_ratio = bright_pixels / total_pixels if total_pixels > 0 else 0.0
+        
+        # --- 2. 判定颜色状态 ---
+        max_pixels = 0
+        dominant_color = 'none'
+        # 默认显示亮度掩码，方便调试气量
+        best_mask = bright_mask 
+        
+        for name, (lower, upper) in color_map.items():
+            mask = cv2.inRange(hsv, lower, upper)
+            count = cv2.countNonZero(mask)
+            if count > max_pixels:
+                max_pixels = count
+                dominant_color = name
+                # 如果需要调试特定颜色，可以在这里覆盖 best_mask
+                # best_mask = mask 
+        
+        # 如果占比低于阈值（说明可能是背景杂色），强制返回 none
+        if fill_ratio < threshold:
+            return 'none', 0.0, best_mask
+            
+        return dominant_color, fill_ratio, best_mask
+
+    def extract_gauge_level(self, frame, roi, gauge_color='none'):
+        """
+        根据气刃状态选择不同的气量提取算法
+        :return: (ratio, debug_mask)
+        """
+        x, y, w, h = roi
+        if w <= 0 or h <= 0: return 0.0, None
+        
+        crop = frame[y:y+h, x:x+w]
+        
+        # 策略分支
+        if gauge_color in ['red', 'red_2']:
+            # 红刃状态：基于列亮度剖面的相对比较法 (抗闪烁干扰)
+            return self._extract_level_brightness_profile(crop, w, h)
+        else:
+            # 非红刃状态：使用原有的垂直线扫描 (已验证非常准确，保持不变)
+            return self._extract_level_vertical_scan(crop, w, h)
+
+    def _extract_level_vertical_scan(self, crop, w, h):
+        """
+        原有的垂直线扫描算法 (保留给非红刃使用)
+        """
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        
+        # 1. 白色高亮 (S低, V高)
+        lower_white = np.array([0, 0, 200])
+        upper_white = np.array([180, 60, 255])
+        mask_white = cv2.inRange(hsv, lower_white, upper_white)
+
+        # 2. 金色高亮 (H黄色区间, V高)
+        lower_gold = np.array([10, 40, 200])
+        upper_gold = np.array([40, 255, 255])
+        mask_gold = cv2.inRange(hsv, lower_gold, upper_gold)
+        
+        mask_line = cv2.bitwise_or(mask_white, mask_gold)
+        
+        col_sums = np.sum(mask_line, axis=0) / 255 
+        threshold_line = h * 0.4
+        candidates = np.where(col_sums > threshold_line)[0]
+        
+        valid_line_x = -1
+        
+        if len(candidates) > 0:
+            candidates = np.sort(candidates)[::-1]
+            for c in candidates:
+                # 检查右侧暗
+                check_w = min(5, w - c - 1)
+                if check_w <= 0: continue
+                right_strip_v = hsv[:, c+1:c+1+check_w, 2]
+                avg_v = np.mean(right_strip_v)
+                
+                # 检查左侧亮
+                check_w_left = min(5, c)
+                avg_v_left = 0
+                if check_w_left > 0:
+                    left_strip_v = hsv[:, c-check_w_left:c, 2]
+                    avg_v_left = np.mean(left_strip_v)
+                
+                if avg_v < 80 and avg_v_left > 80:
+                    valid_line_x = c
+                    break
+        
+        if valid_line_x != -1:
+            ratio = (valid_line_x + 1) / w
+            return min(1.0, max(0.0, ratio)), mask_line
+            
+        # Fallback: 亮度边缘检测
+        mask_bright = cv2.inRange(hsv, np.array([0, 0, 80]), np.array([180, 255, 255]))
+        col_sums_bright = np.sum(mask_bright, axis=0) / 255
+        bright_cols = np.where(col_sums_bright > h * 0.3)[0]
+        
+        if len(bright_cols) > 0:
+            for i in range(len(bright_cols) - 1, -1, -1):
+                col_idx = bright_cols[i]
+                if col_idx > 5:
+                    left_region = hsv[:, col_idx-5:col_idx, 2]
+                    if np.mean(left_region) > 80:
+                        ratio = (col_idx + 1) / w
+                        return min(1.0, max(0.0, ratio)), mask_bright
+            
+        return 0.0, mask_line
+
+    def _extract_level_brightness_profile(self, crop, w, h):
+        """
+        基于列平均亮度的相对比较法 (红刃专用)
+        核心思路: 右侧(已消耗)无论是纯暗还是暗红闪烁，亮度始终低于左侧(剩余)
+        使用相对阈值而非绝对阈值，天然抗闪烁干扰
+        """
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        v_channel = hsv[:, :, 2].astype(np.float32)
+
+        # 1. 每列平均亮度
+        col_means = np.mean(v_channel, axis=0)
+
+        # 2. 重度高斯平滑，消除波浪纹和闪烁的局部波动
+        kernel_size = max(3, w // 6)
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        smoothed = cv2.GaussianBlur(col_means.reshape(1, -1), (kernel_size, 1), 0).flatten()
+
+        # 3. 以左侧区域作为 "满值" 参考亮度
+        ref_cols = max(3, w // 7)
+        ref_brightness = np.mean(smoothed[:ref_cols])
+
+        # 整体太暗 → 气量为 0
+        if ref_brightness < 40:
+            return 0.0, self._build_profile_debug(v_channel, smoothed, w, h, 0)
+
+        # 4. 动态阈值: 低于参考亮度的 65% 视为 "已消耗"
+        threshold = ref_brightness * 0.65
+
+        # 5. 从右向左滑动窗口扫描，找到第一段持续高亮区域的右端
+        window = max(3, w // 15)
+        boundary = 0
+        for x in range(w - window, -1, -1):
+            if np.mean(smoothed[x:x + window]) > threshold:
+                boundary = min(x + window, w)
+                break
+
+        ratio = boundary / w
+        debug = self._build_profile_debug(v_channel, smoothed, w, h, boundary)
+        return min(1.0, max(0.0, ratio)), debug
+
+    def _build_profile_debug(self, v_channel, smoothed, w, h, boundary):
+        """
+        生成亮度剖面调试图:
+        上部 = V 通道原图 (直观看到亮暗分布)
+        下部 = 平滑后亮度曲线 (算法实际依据)
+        白色竖线 = 检测到的边界位置
+        """
+        graph_h = max(h, 40)
+        debug_h = h + graph_h
+        debug = np.zeros((debug_h, w), dtype=np.uint8)
+
+        # 上部: V 通道原图
+        debug[:h, :] = v_channel.astype(np.uint8)
+
+        # 下部: 平滑亮度曲线
+        max_val = max(np.max(smoothed), 1)
+        for x in range(w):
+            y_pos = int((1.0 - smoothed[x] / max_val) * (graph_h - 1))
+            y_pos = max(0, min(graph_h - 1, y_pos))
+            debug[h + y_pos:h + graph_h, x] = 100  # 曲线下方填充
+            debug[h + y_pos, x] = 255               # 曲线线条
+
+        # boundary 白色竖线
+        if 0 < boundary < w:
+            debug[:, min(boundary, w - 1)] = 255
+
+        return debug
+
+    # --- 预定义颜色字典 ---
+    # 斩位颜色 (大致范围，需根据实际游戏微调)
+    SHARPNESS_COLORS = {
+        # [优化] 收紧白色范围：S最大30->20, V最小200->220，防止高亮红被误判
+        'white':  (np.array([0, 0, 220]), np.array([180, 20, 255])),
+        'blue':   (np.array([100, 150, 150]), np.array([130, 255, 255])),
+        'green':  (np.array([40, 50, 50]), np.array([80, 255, 255])),
+        # [优化] 提高黄色饱和度门槛 100->150，防止灰色被误判
+        'yellow': (np.array([15, 150, 100]), np.array([35, 255, 255])),
+        'red':    (np.array([0, 150, 150]), np.array([10, 255, 255])),
+        'red_2':  (np.array([170, 150, 150]), np.array([180, 255, 255])), # 新增红色 wrap 范围
+    }
+
+    # 太刀气刃槽颜色 (无/白/黄/红)
+    # 气刃槽通常是发光的，亮度(V)较高
+    SPIRIT_COLORS = {
+        # [精准过滤] 提高 S 下限过滤浅红闪烁，降低 V 下限以捕捉深红填充
+        'red':    (np.array([0, 150, 50]), np.array([10, 255, 255])),
+        'red_2':  (np.array([170, 150, 50]), np.array([180, 255, 255])),
+        
+        # 黄色：[修复] V 回调到 100，解决非红刃状态下黄色无法识别的问题
+        'yellow': (np.array([15, 80, 100]), np.array([35, 255, 255])),
+        
+        # [移除] 白色：不再单独识别白色，防止波浪特效抢走红色的判定
+        # 波浪的白色像素会计入 fill_ratio (因为够亮)，但不会干扰 dominant_color
+    }
+
+# 调试代码
+if __name__ == "__main__":
+    processor = ImageProcessor()
+    
+    # 创建一个模拟的血条图像
+    dummy_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    # 在 (100, 50) 处画一个绿色矩形模拟满血
+    cv2.rectangle(dummy_frame, (100, 50), (300, 70), (0, 255, 0), -1) 
+    
+    # 测试预处理
+    obs = processor.preprocess_frame(dummy_frame)
+    print(f"Observation shape: {obs.shape}")
+    
+    # 测试血量提取
+    roi = (100, 50, 200, 20) # x, y, w, h
+    ratio, mask = processor.extract_health_bar(dummy_frame, roi)
+    print(f"Health Ratio: {ratio:.2f}")
+    
+    cv2.imshow("Processed Observation", obs)
+    cv2.imshow("Health Mask", mask)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()

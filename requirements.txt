@@ -1,0 +1,13 @@
+torch
+stable-baselines3
+gymnasium
+opencv-python
+numpy
+mss
+pygetwindow
+vgamepad
+shimmy>=1.0.0
+tensorboard
+keyboard
+Pillow
+# pytesseract  # optional: fallback OCR when CRNN model is not available

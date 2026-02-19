@@ -1,0 +1,19 @@
+# Data
+data/
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+
+# Logs
+logs/
+
+# Models (large files)
+models/PPO-*/
+models/crnn/*.pth
+
+# Misc
+nul
